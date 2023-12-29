@@ -1,53 +1,220 @@
 """
 Model admin views.
 """
-from django.db.models import Model
-from django.db import transaction
-from django.utils.translation import gettext_lazy as _
-from django.contrib.contenttypes.models import ContentType
-from django.core.exceptions import FieldDoesNotExist, ObjectDoesNotExist
-from django.contrib.admin.utils import label_for_field, lookup_field, unquote
-from django.contrib.admin.options import (TO_FIELD_VAR,
-                                          IncorrectLookupParameters,
-                                          get_content_type_for_model)
+import json
+from django.db                              import models
+from django.db.models                       import Model, DateField, DateTimeField, Q
+from django.db                              import transaction
+from django.utils.translation               import gettext_lazy as _
+from django.contrib.contenttypes.models     import ContentType
+from django.core.exceptions                 import FieldDoesNotExist, ObjectDoesNotExist
+from django.contrib.admin.utils             import label_for_field, lookup_field, unquote
+from django.contrib.admin.options           import (TO_FIELD_VAR, IncorrectLookupParameters, get_content_type_for_model)
+from django.conf                            import settings
 
-from rest_framework import status
-from rest_framework.views import APIView
-from rest_framework.reverse import reverse
-from rest_framework.response import Response
-from rest_framework.exceptions import NotFound, PermissionDenied
+from rest_framework                     import status, serializers
+from rest_framework.views               import APIView
+from rest_framework.reverse             import reverse
+from rest_framework.response            import Response
+from rest_framework.exceptions          import NotFound, PermissionDenied
 
-from django_api_admin.declarations.classes import ModelDiffHelper
-from django_api_admin.declarations.functions import (get_form_fields,
-                                                     get_form_config,
-                                                     validate_bulk_edits,
-                                                     get_inlines)
+from django_api_admin.declarations.classes      import ModelDiffHelper
+from django_api_admin.declarations.functions    import (get_form_fields, get_form_config, validate_bulk_edits, get_inlines)
+from django_api_admin.pagination                import CustomPageNumberPagination
+
+# Imports related to filters
+from rest_framework.filters             import SearchFilter
+from django_filters                     import rest_framework as filters
+from django_filters.rest_framework      import DjangoFilterBackend
 
 
+
+# Recursive Dynamic Serializer
+# -----------------------------
+# This function is used to serialize Django model instances recursively.
+# It is particularly useful for nested or related Django models where
+# depth control is essential to prevent overly deep recursion.
+def serialize_related_object(obj, depth=5):
+    if obj is None:
+        return None
+    
+    # Terminate recursion if maximum depth is reached.
+    if depth <= 0:
+        return {'pk': obj.pk}
+
+    # Extract any custom methods specified in the model's 'api_meta'.
+    # These methods are additional to the model's standard fields and are
+    # included in serialization.
+    api_functions = getattr(type(obj), 'api_meta', {}).get('api_function', [])
+    
+    # Get all field names from the model.
+    model_fields = [f.name for f in type(obj)._meta.fields]
+    
+    # Combine model fields and api_function methods for serialization.
+    all_fields = model_fields + api_functions
+
+    # Define a dynamic serializer class within the function.
+    # This class is created dynamically for each object to be serialized.
+    class DynamicSerializer(serializers.ModelSerializer):
+        # Dynamically create SerializerMethodFields for each method in api_functions.
+        for method_name in api_functions:
+            locals()[method_name] = serializers.SerializerMethodField()
+
+        class Meta:
+            model = type(obj)
+            fields = all_fields
+
+        # Override the to_representation method to customize the serialization process.
+        def to_representation(self, instance):
+            ret = super().to_representation(instance)
+            
+            # Serialize the results of the api_function methods.
+            for method_name in api_functions:
+                ret[method_name] = getattr(instance, method_name)()
+
+            # Iterate over each field and recursively serialize related objects.
+            for field_name, value in ret.items():
+                try:
+                    field = instance._meta.get_field(field_name)
+                    # Recursively serialize ForeignKey and OneToOneField.
+                    if isinstance(field, (models.ForeignKey, models.OneToOneField)) and value is not None:
+                        related_obj = getattr(instance, field_name)
+                        ret[field_name] = serialize_related_object(related_obj, depth-1)
+                    
+                    # Recursively serialize ManyToManyField.
+                    elif isinstance(field, models.ManyToManyField):
+                        related_objs = getattr(instance, field_name).all()
+                        ret[field_name] = [serialize_related_object(related_obj, depth-1) for related_obj in related_objs]
+                except FieldDoesNotExist:
+                    # Skip non-field attributes (like methods).
+                    pass
+
+            return ret
+
+    # Dynamically create methods for SerializerMethodField.
+    for method_name in api_functions:
+        def method_handler(self, instance, method_name=method_name):
+            return getattr(instance, method_name)()
+        setattr(DynamicSerializer, f'get_{method_name}', method_handler)
+
+    # serialized data.
+    serialized_data = DynamicSerializer(obj).data
+
+    return serialized_data
+
+
+# ListView Class
+# --------------
+# This class extends the GenericAPIView and provides a method to return a list of model instances.
+# It includes functionality for filtering and pagination.
 class ListView(APIView):
     """
     Return a list containing all instances of this model.
     """
 
-    serializer_class = None
-    permission_classes = []
+    serializer_class    = None
+    permission_classes  = []
 
+    search_fields       =   []  # To be constructed dynamically inside the get method.
+    filter_backends     =   [DjangoFilterBackend, SearchFilter]  # Enable filtering in the browsable API.
+    pagination_class    =   CustomPageNumberPagination  # Use the custom pagination class.
+    
+
+    # Method to create a dynamic FilterSet class based on the given model and filter fields.
+    def create_dynamic_filterset(self, model_name, filter_fields):
+        # Dynamically add date range filters for date-related fields
+        for field in self.model._meta.get_fields():
+            if isinstance(field, (DateField, DateTimeField)) and field.name in filter_fields:
+                exec(f"{field.name}_from = filters.DateFilter(field_name='{field.name}', lookup_expr='gte')")
+                exec(f"{field.name}_to = filters.DateFilter(field_name='{field.name}', lookup_expr='lte')")
+
+        class DynamicFilterSet(filters.FilterSet):
+            search = filters.CharFilter(method='filter_search')
+
+            def filter_search(self, queryset, name, value):
+                if not value:
+                    return queryset
+
+                search_fields = getattr(self.Meta.model, 'admin_meta', {}).get('search_fields', [])
+                if not search_fields:
+                    return queryset
+
+                # Constructing the search query
+                search_query = Q()
+                for field in search_fields:
+                    search_query |= Q(**{f"{field}__icontains": value})
+
+                return queryset.filter(search_query)
+
+            class Meta:
+                model = model_name
+                fields = filter_fields
+        return DynamicFilterSet
+
+	# Get Search Fields for search filters in DRF 
+    def get_search_fields(self, model):
+        return getattr(model, 'admin_meta', {}).get('search_fields', ())
+
+    # Method to retrieve the queryset. This is to be implemented by subclasses.
+    def get_queryset(self):
+        return self.admin.get_queryset(self.request)
+
+    # Helper method to determine the requested depth for nested serialization.
+    # You can also pass a depth parameter from the front end with ?depth=3
+    def get_requested_depth(self, request):
+        # Fetch depth limits from settings with fallback to default values.
+        SERIALIZER_MIN_DEPTH = getattr(settings, 'SERIALIZER_MIN_DEPTH', 1)
+        SERIALIZER_MAX_DEPTH = getattr(settings, 'SERIALIZER_MAX_DEPTH', 3)
+        try:
+            requested_depth = int(request.query_params.get('depth', SERIALIZER_MIN_DEPTH))
+            return requested_depth
+        except ValueError:
+            requested_depth = SERIALIZER_MIN_DEPTH
+        return min(SERIALIZER_MAX_DEPTH, max(SERIALIZER_MIN_DEPTH, requested_depth))
+
+
+    # GET method implementation for ListView.
     def get(self, request, admin):
-        queryset = admin.get_queryset(request)
-        page = admin.admin_site.paginate_queryset(queryset, request, view=self)
-        serializer = self.serializer_class(page, many=True)
-        data = serializer.data
-        info = (
-            admin.admin_site.name,
-            admin.model._meta.app_label,
-            admin.model._meta.model_name
-        )
-        pattern = '%s:%s_%s_detail'
+        # Preparing filter functionality.
+        self.request            = request
+        self.admin              = admin
+        model                   = admin.model
+        self.model              = model
 
-        for item in data:
-            item['detail_url'] = reverse(pattern % info, kwargs={
-                'object_id': item['pk']}, request=request)
-        return Response(data, status=status.HTTP_200_OK)
+        # Filters
+        filter_fields                   = list(getattr(model, 'admin_meta', {}).get('list_filter', []))
+        self.search_fields              = self.get_search_fields(admin.model)  # Set search fields
+        date_related_fields             = [field.name for field in model._meta.get_fields() if isinstance(field, (DateField, DateTimeField))] # Get Date and Datetime Related Fields
+        filter_fields.extend(date_related_fields)  # Add date-related fields
+
+        if self.search_fields:
+            filter_fields.append('search')  # Add search field
+            
+        DynamicFilterSet                = self.create_dynamic_filterset(model, filter_fields)
+        self.filterset_class            = DynamicFilterSet
+
+        # Filtering the queryset.
+        queryset    = admin.get_queryset(request)
+        filter_set  = DynamicFilterSet(request.GET, queryset=queryset)
+        if not filter_set.is_valid():
+            return Response(filter_set.errors, status=400)
+
+        try:
+            queryset = filter_set.qs.order_by('-updated_at')
+        except:
+            queryset = filter_set.qs
+        
+        # Pagination handling.
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            requested_depth = self.get_requested_depth(request)
+            serialized_data = [serialize_related_object(obj, requested_depth) for obj in page]
+            return self.get_paginated_response(serialized_data)
+
+        # Fallback for non-paginated responses.
+        requested_depth = self.get_requested_depth(request)
+        serialized_data = [serialize_related_object(obj, requested_depth) for obj in queryset]
+        return Response(serialized_data, status=status.HTTP_200_OK)
 
 
 class DetailView(APIView):
