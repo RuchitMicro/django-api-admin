@@ -17,6 +17,7 @@ from rest_framework.views               import APIView
 from rest_framework.reverse             import reverse
 from rest_framework.response            import Response
 from rest_framework.exceptions          import NotFound, PermissionDenied
+from rest_framework.generics            import GenericAPIView
 
 from django_api_admin.declarations.classes      import ModelDiffHelper
 from django_api_admin.declarations.functions    import (get_form_fields, get_form_config, validate_bulk_edits, get_inlines)
@@ -107,7 +108,7 @@ def serialize_related_object(obj, depth=5):
 # --------------
 # This class extends the GenericAPIView and provides a method to return a list of model instances.
 # It includes functionality for filtering and pagination.
-class ListView(APIView):
+class ListView(GenericAPIView):
     """
     Return a list containing all instances of this model.
     """
@@ -122,14 +123,22 @@ class ListView(APIView):
 
     # Method to create a dynamic FilterSet class based on the given model and filter fields.
     def create_dynamic_filterset(self, model_name, filter_fields):
-        # Dynamically add date range filters for date-related fields
+        # Prepare dynamic filter fields, especially for date range filters
+        dynamic_filters = {field: filters.CharFilter(lookup_expr='icontains') for field in filter_fields}
+
+        # Add date range filters for date-related fields
         for field in self.model._meta.get_fields():
             if isinstance(field, (DateField, DateTimeField)) and field.name in filter_fields:
-                exec(f"{field.name}_from = filters.DateFilter(field_name='{field.name}', lookup_expr='gte')")
-                exec(f"{field.name}_to = filters.DateFilter(field_name='{field.name}', lookup_expr='lte')")
+                dynamic_filters[f'{field.name}_from'] = filters.DateFilter(field_name=field.name, lookup_expr='gte')
+                dynamic_filters[f'{field.name}_to'] = filters.DateFilter(field_name=field.name, lookup_expr='lte')
 
         class DynamicFilterSet(filters.FilterSet):
-            search = filters.CharFilter(method='filter_search')
+
+             # Add dynamic filters
+            for name, filter_ in dynamic_filters.items():
+                locals()[name] = filter_
+
+            search = filters.CharFilter(method='filter_search', label="Search                 ")
 
             def filter_search(self, queryset, name, value):
                 if not value:
@@ -148,7 +157,7 @@ class ListView(APIView):
 
             class Meta:
                 model = model_name
-                fields = filter_fields
+                fields = list(dynamic_filters.keys())
         return DynamicFilterSet
 
 	# Get Search Fields for search filters in DRF 

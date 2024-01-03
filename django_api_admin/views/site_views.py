@@ -16,6 +16,14 @@ from rest_framework.reverse import reverse
 
 from django_api_admin.declarations.functions import get_form_fields
 
+is_jwt = False
+try:
+    from rest_framework_simplejwt.tokens import RefreshToken
+    is_jwt = True
+except ImportError:
+    pass
+
+
 class CsrfTokenView(APIView):
     serializer_class = None
     permission_classes = []
@@ -51,10 +59,26 @@ class LoginView(APIView):
         if serializer.is_valid():
             user = serializer.get_user()
             login(request, user)
+
+            jwt_data = {}
+            if is_jwt:
+                # Generate JWT token
+                refresh = RefreshToken.for_user(user)
+                access_token = str(refresh.access_token)
+                jwt_data = {
+                    'access_token': access_token,
+                    'refresh_token': str(refresh),
+                    'user_id': user.id,
+                    'token_type': 'Bearer',
+                    'expires_in': refresh.access_token.lifetime.total_seconds()
+                }
+
+
             user_serializer = admin_site.user_serializer(user)
             data = {
-                'detail': _('you are logged in successfully'),
-                'user': user_serializer.data
+                'detail'        :   _('you are logged in successfully'),
+                'user'          :   user_serializer.data,
+                'jwt_data'      :   jwt_data
             }
             return Response(data, status=status.HTTP_200_OK)
 
