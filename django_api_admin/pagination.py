@@ -29,6 +29,8 @@ class AdminLogPagination(PageNumberPagination):
 # This class extends the PageNumberPagination class provided by Django REST framework.
 # It provides a custom response format for paginated data, including various page links.
 class CustomPageNumberPagination(PageNumberPagination):
+    page_size_query_param = 'page_size'
+    
     def get_paginated_response(self, data):
         # Building the base URL for the current request.
         base_url = self.request.build_absolute_uri()

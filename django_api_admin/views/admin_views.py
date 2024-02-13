@@ -3,7 +3,7 @@ Model admin views.
 """
 import json
 from django.db                              import models
-from django.db.models                       import Model, DateField, DateTimeField, Q
+from django.db.models                       import *
 from django.db                              import transaction
 from django.utils.translation               import gettext_lazy as _
 from django.contrib.contenttypes.models     import ContentType
@@ -126,19 +126,42 @@ class ListView(GenericAPIView):
         # Prepare dynamic filter fields, especially for date range filters
         dynamic_filters = {field: filters.CharFilter(lookup_expr='icontains') for field in filter_fields}
 
-        # Add date range filters for date-related fields
-        for field in self.model._meta.get_fields():
-            if isinstance(field, (DateField, DateTimeField)) and field.name in filter_fields:
-                dynamic_filters[f'{field.name}_from'] = filters.DateFilter(field_name=field.name, lookup_expr='gte')
-                dynamic_filters[f'{field.name}_to'] = filters.DateFilter(field_name=field.name, lookup_expr='lte')
+        dynamic_filters = {}
+
+        for field_name in filter_fields:
+            # Search is a special field that is handled separately
+            if field_name == 'search':
+                continue
+            
+            # Check if the field is a ForeignKey
+            field = model_name._meta.get_field(field_name)
+            if isinstance(field, ForeignKey):
+                # For ForeignKey, use ModelChoiceFilter or a related field filter
+                related_model = field.related_model
+                dynamic_filters[field_name] = filters.ModelChoiceFilter(label = field_name, queryset=related_model.objects.all())
+            elif isinstance(field, BooleanField):
+                # For BooleanField, use BooleanFilter
+                dynamic_filters[field_name] = filters.BooleanFilter(label = field_name)
+            elif isinstance(field, IntegerField):
+                # For BooleanField, use BooleanFilter
+                dynamic_filters[field_name] = filters.NumberFilter(label = field_name)
+            else:
+                # For other fields, use CharFilter with 'icontains'
+                dynamic_filters[field_name] = filters.CharFilter(lookup_expr='icontains')
+
+            # Handling date and datetime fields
+            if isinstance(field, (DateField, DateTimeField)):
+                dynamic_filters[f'{field_name}_from']   = filters.DateFilter(field_name = field_name, lookup_expr='gte')
+                dynamic_filters[f'{field_name}_to']     = filters.DateFilter(field_name = field_name, lookup_expr='lte')
+
 
         class DynamicFilterSet(filters.FilterSet):
 
-             # Add dynamic filters
+            # Add dynamic filters
             for name, filter_ in dynamic_filters.items():
                 locals()[name] = filter_
 
-            search = filters.CharFilter(method='filter_search', label="Search                 ")
+            search = filters.CharFilter(label='Search               ', method='filter_search')
 
             def filter_search(self, queryset, name, value):
                 if not value:
@@ -151,7 +174,17 @@ class ListView(GenericAPIView):
                 # Constructing the search query
                 search_query = Q()
                 for field in search_fields:
-                    search_query |= Q(**{f"{field}__icontains": value})
+                    # Split the field on '__' to check for foreign key relationships
+                    field_parts = field.split('__')
+                    if len(field_parts) > 1:
+                        # Construct a query for a foreign key relationship
+                        fk_field = "__".join(field_parts[:-1])
+                        related_field = field_parts[-1]
+                        search_query |= Q(**{f"{fk_field}__{related_field}__id": value})
+                    else:
+                        # Query for a regular field
+                        search_query |= Q(**{f"{field}__icontains": value})
+
 
                 return queryset.filter(search_query)
 
